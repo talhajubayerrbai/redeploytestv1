@@ -1,20 +1,23 @@
 ---
-- name: Configure EC2 instance and deploy FastAPI app
+- name: Configure EC2 and deploy FastAPI application
   hosts: all
   become: true
   gather_facts: true
 
   vars:
     app_dir: /opt/app
-    venv_dir: /opt/app/.venv
     app_user: ubuntu
+    venv_dir: /opt/app/.venv
+    python_bin: /usr/bin/python3.11
     gunicorn_bin: /opt/app/.venv/bin/gunicorn
     service_name: fastapi-app
+    project_root: "{{ lookup('env', 'GITHUB_WORKSPACE') }}"
 
   tasks:
 
-    #  System packages 
-
+    # -------------------------------------------------------------------------
+    # System packages
+    # -------------------------------------------------------------------------
     - name: Update apt cache
       apt:
         update_cache: yes
@@ -28,14 +31,15 @@
           - python3.11-dev
           - python3-pip
           - nginx
-          - curl
           - git
-          - rsync
+          - curl
+          - build-essential
         state: present
 
-    #  Application directory ownership 
-
-    - name: Ensure /opt/app exists and is owned by app user
+    # -------------------------------------------------------------------------
+    # Application directory
+    # -------------------------------------------------------------------------
+    - name: Create application directory
       file:
         path: "{{ app_dir }}"
         state: directory
@@ -43,118 +47,185 @@
         group: "{{ app_user }}"
         mode: "0755"
 
-    #  Python virtual environment 
+    # -------------------------------------------------------------------------
+    # Copy application source from checked-out repo
+    # -------------------------------------------------------------------------
+    - name: Synchronise application source to EC2
+      synchronize:
+        src: "{{ project_root }}/"
+        dest: "{{ app_dir }}/"
+        delete: yes
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=.github"
+          - "--exclude=terraform"
+          - "--exclude=ansible"
+          - "--exclude=__pycache__"
+          - "--exclude=*.pyc"
+          - "--exclude=.env"
+      become: false
 
+    - name: Fix ownership of application files
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        recurse: yes
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+
+    # -------------------------------------------------------------------------
+    # Python virtual environment
+    # -------------------------------------------------------------------------
     - name: Create Python 3.11 virtual environment
-      become_user: "{{ app_user }}"
-      command: python3.11 -m venv {{ venv_dir }}
+      command: "{{ python_bin }} -m venv {{ venv_dir }}"
       args:
-        creates: "{{ venv_dir }}/bin/python"
+        creates: "{{ venv_dir }}/bin/activate"
+      become_user: "{{ app_user }}"
 
     - name: Upgrade pip inside venv
-      become_user: "{{ app_user }}"
       command: "{{ venv_dir }}/bin/pip install --upgrade pip"
-
-    - name: Install Python requirements
       become_user: "{{ app_user }}"
+
+    - name: Install Python dependencies from requirements.txt
       command: "{{ venv_dir }}/bin/pip install -r {{ app_dir }}/requirements.txt"
       args:
         chdir: "{{ app_dir }}"
+      become_user: "{{ app_user }}"
+      when: lookup('fileglob', project_root + '/requirements.txt') != []
 
-    #  Systemd service 
+    - name: Install fallback dependencies when no requirements.txt present
+      command: >
+        {{ venv_dir }}/bin/pip install
+        fastapi uvicorn[standard] gunicorn python-multipart
+        aiofiles httpx pydantic
+      become_user: "{{ app_user }}"
+      when: lookup('fileglob', project_root + '/requirements.txt') == []
 
-    - name: Write systemd service unit
+    # -------------------------------------------------------------------------
+    # .env file (rendered via shell to tolerate empty values)
+    # -------------------------------------------------------------------------
+    - name: Write .env file
+      shell: |
+        cat > {{ app_dir }}/.env << 'ENVEOF'
+        APP_ENV=production
+        PORT=8000
+        HOST=0.0.0.0
+        ENVEOF
+      args:
+        executable: /bin/bash
+
+    - name: Fix .env ownership
+      file:
+        path: "{{ app_dir }}/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0640"
+
+    # -------------------------------------------------------------------------
+    # public/index.html - copy from repo if it exists
+    # -------------------------------------------------------------------------
+    - name: Check if public/index.html exists in repo
+      stat:
+        path: "{{ project_root }}/public/index.html"
+      register: index_html_stat
+      delegate_to: localhost
+      become: false
+
+    - name: Ensure public directory exists on remote
+      file:
+        path: "{{ app_dir }}/public"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+      when: index_html_stat.stat.exists
+
+    - name: Copy public/index.html from repo to remote
       copy:
-        dest: /etc/systemd/system/{{ service_name }}.service
-        owner: root
-        group: root
+        src: "{{ project_root }}/public/index.html"
+        dest: "{{ app_dir }}/public/index.html"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
         mode: "0644"
-        content: |
-          [Unit]
-          Description=FastAPI application (gunicorn + uvicorn)
-          After=network.target
+      when: index_html_stat.stat.exists
 
-          [Service]
-          Type=simple
-          User={{ app_user }}
-          Group={{ app_user }}
-          WorkingDirectory={{ app_dir }}
-          ExecStart={{ gunicorn_bin }} app.main:app \
-              -k uvicorn.workers.UvicornWorker \
-              -w 4 \
-              -b 0.0.0.0:8000 \
-              --access-logfile - \
-              --error-logfile -
-          Restart=always
-          RestartSec=5
-          StandardOutput=journal
-          StandardError=journal
-          SyslogIdentifier={{ service_name }}
-          Environment="PATH={{ venv_dir }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    # -------------------------------------------------------------------------
+    # systemd service
+    # -------------------------------------------------------------------------
+    - name: Write systemd service unit
+      shell: |
+        cat > /etc/systemd/system/{{ service_name }}.service << 'SVCEOF'
+        [Unit]
+        Description=FastAPI application (gunicorn + uvicorn)
+        After=network.target
 
-          [Install]
-          WantedBy=multi-user.target
+        [Service]
+        Type=simple
+        User={{ app_user }}
+        Group={{ app_user }}
+        WorkingDirectory={{ app_dir }}
+        EnvironmentFile={{ app_dir }}/.env
+        ExecStart={{ gunicorn_bin }} app.main:app -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:8000
+        Restart=always
+        RestartSec=5
+        StandardOutput=journal
+        StandardError=journal
+        SyslogIdentifier={{ service_name }}
+
+        [Install]
+        WantedBy=multi-user.target
+        SVCEOF
+      args:
+        executable: /bin/bash
 
     - name: Reload systemd daemon
       systemd:
         daemon_reload: yes
 
-    - name: Enable and start FastAPI service
+    - name: Enable and start application service
       systemd:
         name: "{{ service_name }}"
         enabled: yes
         state: restarted
 
-    - name: Wait for gunicorn to bind port 8000
-      wait_for:
-        host: 127.0.0.1
-        port: 8000
-        delay: 3
-        timeout: 60
-        state: started
+    # -------------------------------------------------------------------------
+    # nginx configuration
+    # -------------------------------------------------------------------------
+    - name: Write nginx site configuration
+      shell: |
+        cat > /etc/nginx/sites-available/{{ service_name }} << 'NGINXEOF'
+        server {
+            listen 80 default_server;
+            listen [::]:80 default_server;
+            server_name _;
 
-    #  Nginx configuration 
+            access_log /var/log/nginx/{{ service_name }}_access.log;
+            error_log  /var/log/nginx/{{ service_name }}_error.log;
+
+            location / {
+                proxy_pass         http://127.0.0.1:8000;
+                proxy_set_header   Host              $host;
+                proxy_set_header   X-Real-IP         $remote_addr;
+                proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+                proxy_set_header   X-Forwarded-Proto $scheme;
+                proxy_read_timeout 60s;
+                proxy_connect_timeout 10s;
+            }
+        }
+        NGINXEOF
+      args:
+        executable: /bin/bash
+
+    - name: Enable site - symlink into sites-enabled
+      file:
+        src: "/etc/nginx/sites-available/{{ service_name }}"
+        dest: "/etc/nginx/sites-enabled/{{ service_name }}"
+        state: link
 
     - name: Remove default nginx site
       file:
         path: /etc/nginx/sites-enabled/default
         state: absent
-
-    - name: Write nginx site configuration
-      copy:
-        dest: /etc/nginx/sites-available/fastapi-app
-        owner: root
-        group: root
-        mode: "0644"
-        content: |
-          server {
-              listen 80 default_server;
-              listen [::]:80 default_server;
-
-              server_name _;
-
-              access_log /var/log/nginx/fastapi_access.log;
-              error_log  /var/log/nginx/fastapi_error.log;
-
-              location / {
-                  proxy_pass         http://127.0.0.1:8000;
-                  proxy_http_version 1.1;
-                  proxy_set_header   Host              $host;
-                  proxy_set_header   X-Real-IP         $remote_addr;
-                  proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
-                  proxy_set_header   X-Forwarded-Proto $scheme;
-                  proxy_set_header   Upgrade           $http_upgrade;
-                  proxy_set_header   Connection        "upgrade";
-                  proxy_read_timeout 300s;
-                  proxy_connect_timeout 75s;
-              }
-          }
-
-    - name: Enable nginx site
-      file:
-        src: /etc/nginx/sites-available/fastapi-app
-        dest: /etc/nginx/sites-enabled/fastapi-app
-        state: link
 
     - name: Test nginx configuration
       command: nginx -t
@@ -166,14 +237,20 @@
         enabled: yes
         state: restarted
 
-    #  Final service status check 
+    # -------------------------------------------------------------------------
+    # Smoke test from the EC2 host itself
+    # -------------------------------------------------------------------------
+    - name: Wait for gunicorn to be ready on port 8000
+      wait_for:
+        host: 127.0.0.1
+        port: 8000
+        delay: 3
+        timeout: 60
 
-    - name: Verify FastAPI service is active
-      command: systemctl is-active {{ service_name }}
-      register: service_status
-      failed_when: service_status.stdout != "active"
+    - name: Local smoke test - /health via nginx (port 80)
+      command: curl -sf http://127.0.0.1/health
+      register: smoke_result
+      retries: 6
+      delay: 5
+      until: smoke_result.rc == 0
       changed_when: false
-
-    - name: Show service status
-      debug:
-        msg: "FastAPI service status: {{ service_status.stdout }}"
