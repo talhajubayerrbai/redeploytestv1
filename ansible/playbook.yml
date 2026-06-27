@@ -1,0 +1,179 @@
+---
+- name: Configure EC2 instance and deploy FastAPI app
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dir: /opt/app
+    venv_dir: /opt/app/.venv
+    app_user: ubuntu
+    gunicorn_bin: /opt/app/.venv/bin/gunicorn
+    service_name: fastapi-app
+
+  tasks:
+
+    #  System packages 
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - python3.11
+          - python3.11-venv
+          - python3.11-dev
+          - python3-pip
+          - nginx
+          - curl
+          - git
+          - rsync
+        state: present
+
+    #  Application directory ownership 
+
+    - name: Ensure /opt/app exists and is owned by app user
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    #  Python virtual environment 
+
+    - name: Create Python 3.11 virtual environment
+      become_user: "{{ app_user }}"
+      command: python3.11 -m venv {{ venv_dir }}
+      args:
+        creates: "{{ venv_dir }}/bin/python"
+
+    - name: Upgrade pip inside venv
+      become_user: "{{ app_user }}"
+      command: "{{ venv_dir }}/bin/pip install --upgrade pip"
+
+    - name: Install Python requirements
+      become_user: "{{ app_user }}"
+      command: "{{ venv_dir }}/bin/pip install -r {{ app_dir }}/requirements.txt"
+      args:
+        chdir: "{{ app_dir }}"
+
+    #  Systemd service 
+
+    - name: Write systemd service unit
+      copy:
+        dest: /etc/systemd/system/{{ service_name }}.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=FastAPI application (gunicorn + uvicorn)
+          After=network.target
+
+          [Service]
+          Type=simple
+          User={{ app_user }}
+          Group={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          ExecStart={{ gunicorn_bin }} app.main:app \
+              -k uvicorn.workers.UvicornWorker \
+              -w 4 \
+              -b 0.0.0.0:8000 \
+              --access-logfile - \
+              --error-logfile -
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier={{ service_name }}
+          Environment="PATH={{ venv_dir }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start FastAPI service
+      systemd:
+        name: "{{ service_name }}"
+        enabled: yes
+        state: restarted
+
+    - name: Wait for gunicorn to bind port 8000
+      wait_for:
+        host: 127.0.0.1
+        port: 8000
+        delay: 3
+        timeout: 60
+        state: started
+
+    #  Nginx configuration 
+
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Write nginx site configuration
+      copy:
+        dest: /etc/nginx/sites-available/fastapi-app
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+
+              server_name _;
+
+              access_log /var/log/nginx/fastapi_access.log;
+              error_log  /var/log/nginx/fastapi_error.log;
+
+              location / {
+                  proxy_pass         http://127.0.0.1:8000;
+                  proxy_http_version 1.1;
+                  proxy_set_header   Host              $host;
+                  proxy_set_header   X-Real-IP         $remote_addr;
+                  proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+                  proxy_set_header   X-Forwarded-Proto $scheme;
+                  proxy_set_header   Upgrade           $http_upgrade;
+                  proxy_set_header   Connection        "upgrade";
+                  proxy_read_timeout 300s;
+                  proxy_connect_timeout 75s;
+              }
+          }
+
+    - name: Enable nginx site
+      file:
+        src: /etc/nginx/sites-available/fastapi-app
+        dest: /etc/nginx/sites-enabled/fastapi-app
+        state: link
+
+    - name: Test nginx configuration
+      command: nginx -t
+      changed_when: false
+
+    - name: Enable and restart nginx
+      systemd:
+        name: nginx
+        enabled: yes
+        state: restarted
+
+    #  Final service status check 
+
+    - name: Verify FastAPI service is active
+      command: systemctl is-active {{ service_name }}
+      register: service_status
+      failed_when: service_status.stdout != "active"
+      changed_when: false
+
+    - name: Show service status
+      debug:
+        msg: "FastAPI service status: {{ service_status.stdout }}"

@@ -1,0 +1,188 @@
+name: Deploy FastAPI to EC2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build & Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Lint (advisory only)
+        run: |
+          pip install flake8 || true
+          flake8 app/ --max-line-length=120 || true
+        continue-on-error: true
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      #  AWS credentials 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      #  SSH key pair 
+      - name: Generate SSH key pair
+        run: |
+          ssh-keygen -t ed25519 -C "udap-deploy" -f "$HOME/.ssh/udap_deploy" -N ""
+          echo "SSH_PUBLIC_KEY=$(cat $HOME/.ssh/udap_deploy.pub)" >> "$GITHUB_ENV"
+
+      - name: Configure SSH client
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          cat >> ~/.ssh/config <<'EOF'
+          Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            IdentityFile ~/.ssh/udap_deploy
+          EOF
+          chmod 600 ~/.ssh/config
+
+      #  Terraform - provision infra 
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Terraform apply
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="public_key=${SSH_PUBLIC_KEY}"
+
+      - name: Capture Terraform outputs
+        working-directory: terraform
+        run: |
+          SERVER_IP=$(terraform output -raw instance_public_ip)
+          echo "SERVER_IP=${SERVER_IP}" >> "$GITHUB_ENV"
+          echo "APP_URL=$(terraform output -raw app_url)" >> "$GITHUB_ENV"
+          echo "HEALTH_URL=$(terraform output -raw health_url)" >> "$GITHUB_ENV"
+
+      #  Wait for SSH to become available 
+      - name: Wait for SSH
+        run: |
+          echo "Waiting for SSH on $SERVER_IP ..."
+          for i in $(seq 1 30); do
+            if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                   -i ~/.ssh/udap_deploy ubuntu@"$SERVER_IP" "echo ok" 2>/dev/null; then
+              echo "SSH is ready."
+              break
+            fi
+            echo "  attempt $i/30 - sleeping 10s ..."
+            sleep 10
+          done
+
+      #  Rsync application files 
+      - name: Rsync app files to server
+        run: |
+          ssh -i ~/.ssh/udap_deploy ubuntu@"$SERVER_IP" "sudo mkdir -p /opt/app && sudo chown ubuntu:ubuntu /opt/app"
+          rsync -az --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' \
+            --exclude='.venv' --exclude='terraform' --exclude='.github' \
+            -e "ssh -i $HOME/.ssh/udap_deploy -o StrictHostKeyChecking=no" \
+            ./ ubuntu@"$SERVER_IP":/opt/app/
+
+      #  Ansible - configure & start service 
+      - name: Install Ansible
+        run: |
+          pip install --upgrade ansible
+
+      - name: Run Ansible playbook
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook ansible/playbook.yml \
+            -i "$SERVER_IP," \
+            --private-key ~/.ssh/udap_deploy \
+            -u ubuntu \
+            -e "server_ip=$SERVER_IP"
+
+      #  Self-verify: health check 
+      - name: Wait for service and self-verify
+        run: |
+          echo "Health check target: $HEALTH_URL"
+          for i in $(seq 1 24); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$HEALTH_URL" || true)
+            echo "  attempt $i/24 - HTTP $STATUS"
+            if [[ "$STATUS" =~ ^[23] ]]; then
+              echo " App is healthy (HTTP $STATUS)"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo " Health check failed - app did not return 2xx/3xx within 240 s"
+          exit 1
+
+  destroy:
+    name: Destroy Infrastructure (manual)
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.destroy == 'true' }}
+    needs: []
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Terraform destroy
+        working-directory: terraform
+        run: |-
+          terraform destroy -auto-approve \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="public_key=placeholder"
